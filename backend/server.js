@@ -1,153 +1,202 @@
-import 'dotenv/config';
 const express = require('express');
-const bodyParser = require('body-parser');
 const cors = require('cors');
-const twilio = require('twilio');
-const mongoose = require('mongoose');
+const bodyParser = require('body-parser');
+const bcrypt = require('bcrypt');
+const mysql = require('mysql2/promise');
+const jwt = require('jsonwebtoken');
+require('dotenv').config();
 
 const app = express();
+const PORT = process.env.PORT || 5000;
+
+// Middleware
 app.use(cors());
 app.use(bodyParser.json());
 
-// Verify Twilio credentials are loaded
-if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !process.env.TWILIO_PHONE_NUMBER) {
-    console.error('Twilio credentials missing from .env file');
-    process.exit(1);
+// Database connection pool
+const pool = mysql.createPool({
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'sweet_delights',
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
+  });
+  
+  // Add a retry mechanism for database connection
+  async function connectWithRetry() {
+    let retries = 5;
+    while (retries) {
+      try {
+        const connection = await pool.getConnection();
+        console.log('Database connection successful');
+        connection.release();
+        return;
+      } catch (error) {
+        retries -= 1;
+        console.log(`Database connection failed, retries left: ${retries}`);
+        // Wait for 5 seconds before retrying
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      }
+    }
+    console.error('Could not connect to database after multiple retries');
+  }
+  
+  // Replace testConnection with connectWithRetry
+  connectWithRetry();
+  
+// Authentication routes
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { username, email, password } = req.body;
+    
+    // Validate input
+    if (!username || !email || !password) {
+      return res.status(400).json({ message: 'All fields are required' });
+    }
+    
+    // Check if username already exists
+    const [existingUsers] = await pool.query(
+      'SELECT * FROM users WHERE username = ?',
+      [username]
+    );
+    
+    if (existingUsers.length > 0) {
+      return res.status(409).json({ message: 'Username already exists' });
+    }
+    
+    // Check if email already exists
+    const [existingEmails] = await pool.query(
+      'SELECT * FROM users WHERE email = ?',
+      [email]
+    );
+    
+    if (existingEmails.length > 0) {
+      return res.status(409).json({ message: 'Email already exists' });
+    }
+    
+    // Hash password
+    const saltRounds = 10;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+    
+    // Insert new user
+    const [result] = await pool.query(
+      'INSERT INTO users (username, email, password) VALUES (?, ?, ?)',
+      [username, email, hashedPassword]
+    );
+    
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId: result.insertId, username, email },
+      process.env.JWT_SECRET || 'your_jwt_secret',
+      { expiresIn: '24h' }
+    );
+    
+    res.status(201).json({
+      message: 'User registered successfully',
+      token,
+      user: {
+        id: result.insertId,
+        username,
+        email
+      }
+    });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ message: 'Server error during registration' });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    
+    // Validate input
+    if (!username || !password) {
+      return res.status(400).json({ message: 'Username and password are required' });
+    }
+    
+    // Find user by username
+    const [users] = await pool.query(
+      'SELECT * FROM users WHERE username = ?',
+      [username]
+    );
+    
+    if (users.length === 0) {
+      return res.status(401).json({ message: 'Invalid username or password' });
+    }
+    
+    const user = users[0];
+    
+    // Compare passwords
+    const passwordMatch = await bcrypt.compare(password, user.password);
+    
+    if (!passwordMatch) {
+      return res.status(401).json({ message: 'Invalid username or password' });
+    }
+    
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId: user.id, username: user.username, email: user.email },
+      process.env.JWT_SECRET || 'your_jwt_secret',
+      { expiresIn: '24h' }
+    );
+    
+    res.status(200).json({
+      message: 'Login successful',
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email
+      }
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ message: 'Server error during login' });
+  }
+});
+
+// Protected route example
+app.get('/api/user/profile', authenticateToken, async (req, res) => {
+  try {
+    const [user] = await pool.query(
+      'SELECT id, username, email, created_at FROM users WHERE id = ?',
+      [req.user.userId]
+    );
+    
+    if (user.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    res.status(200).json({ user: user[0] });
+  } catch (error) {
+    console.error('Profile fetch error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Middleware to authenticate JWT token
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ message: 'Authentication token required' });
+  }
+  
+  jwt.verify(token, process.env.JWT_SECRET || 'your_jwt_secret', (err, user) => {
+    if (err) {
+      return res.status(403).json({ message: 'Invalid or expired token' });
+    }
+    
+    req.user = user;
+    next();
+  });
 }
 
-const client = twilio(
-    process.env.TWILIO_ACCOUNT_SID,
-    process.env.TWILIO_AUTH_TOKEN
-);
-
-const otpStore = new Map();
-
-// Middleware to clean up expired OTPs
-const cleanExpiredOtps = () => {
-    const now = Date.now();
-    for (const [mobile, { expires }] of otpStore.entries()) {
-        if (now > expires) {
-            otpStore.delete(mobile);
-        }
-    }
-};
-
-// Send OTP endpoint
-app.post('/api/send-otp', async (req, res) => {
-    cleanExpiredOtps();
-    const { mobile } = req.body;
-    
-    // Validate mobile number (Indian format)
-    if (!mobile || mobile.length !== 10 || !/^[6-9]\d{9}$/.test(mobile)) {
-        return res.status(400).json({ 
-            success: false, 
-            message: 'Invalid Indian mobile number. Must be 10 digits starting with 6-9.' 
-        });
-    }
-
-    // Generate 6-digit OTP
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const ttl = 5 * 60 * 1000; // 5 minutes TTL
-
-    try {
-        console.log(`Attempting to send OTP to +91${mobile}`);
-        
-        const message = await client.messages.create({
-            body: `Your Sweet Delights verification code is: ${otp}. Valid for 5 minutes.`,
-            from: process.env.TWILIO_PHONE_NUMBER,
-            to: `+91${mobile}`
-        });
-
-        console.log('Twilio Message SID:', message.sid);
-        otpStore.set(mobile, { otp, expires: Date.now() + ttl });
-        
-        res.json({ 
-            success: true, 
-            message: 'OTP sent successfully',
-            debugInfo: {
-                twilioStatus: message.status,
-                toNumber: message.to,
-                timestamp: new Date().toISOString()
-            }
-        });
-    } catch (error) {
-        console.error('Twilio Error:', error);
-        
-        let errorMessage = 'Failed to send OTP';
-        if (error.code === 21211) {
-            errorMessage = 'Invalid phone number format';
-        } else if (error.code === 21614) {
-            errorMessage = 'This phone number is not currently reachable';
-        }
-
-        res.status(500).json({ 
-            success: false,
-            message: errorMessage,
-            errorDetails: {
-                code: error.code,
-                moreInfo: error.moreInfo,
-                status: error.status
-            }
-        });
-    }
-});
-
-// Verify OTP endpoint
-app.post('/api/verify-otp', (req, res) => {
-    cleanExpiredOtps();
-    const { mobile, otp } = req.body;
-    
-    if (!mobile || !otp) {
-        return res.status(400).json({ 
-            success: false, 
-            message: 'Mobile number and OTP are required' 
-        });
-    }
-
-    const storedOtpData = otpStore.get(mobile);
-    
-    if (!storedOtpData) {
-        return res.status(404).json({ 
-            success: false, 
-            message: 'OTP not found or expired. Please request a new OTP.' 
-        });
-    }
-
-    if (storedOtpData.otp !== otp) {
-        return res.status(401).json({ 
-            success: false, 
-            message: 'Invalid OTP' 
-        });
-    }
-
-    // OTP is valid - remove it from storage
-    otpStore.delete(mobile);
-    
-    res.json({ 
-        success: true, 
-        message: 'OTP verified successfully' 
-    });
-});
-
-// Connect to MongoDB
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('Connected to MongoDB'))
-  .catch(err => console.error('MongoDB connection error:', err));
-
-// Add auth routes
-const authRoutes = require('./routes/authRoutes');
-app.use('/api/auth', authRoutes);
-
-// Error handling middleware
-app.use((err, req, res, next) => {
-    console.error('Server Error:', err);
-    res.status(500).json({ 
-        success: false, 
-        message: 'Internal server error' 
-    });
-});
-
-const PORT = process.env.PORT || 5000;
+// Start server
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });

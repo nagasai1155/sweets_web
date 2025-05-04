@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "5000:5000"
+    environment:
+      - PORT=5000
+      - DB_HOST=db  
+      - DB_USER=root
+      - DB_PASSWORD=Nagasai@6302
+      - DB_NAME=ecomerce
+      - JWT_SECRET=6d9863a444e064aa14b892abb2b17f4cad9b9b0fce43f8e07a20efffec89b52e0f24fdd7eca6b9e93b4119863cf243e3d75d3631afa2c76aa99c34cb8d09db0e
+    depends_on:
+      - db
+    restart: unless-stopped
+
+  db:
+    image: mysql:8.0
+    ports:
+      - "3307:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=Nagasai@6302
+      - MYSQL_DATABASE=ecomerce
+    volumes:
+      - mysql_data:/var/lib/mysql
+    restart: unless-stopped
+
+volumes:
+  mysql_data:
